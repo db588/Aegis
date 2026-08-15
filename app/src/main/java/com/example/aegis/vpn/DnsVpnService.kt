@@ -11,14 +11,31 @@ import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import com.example.aegis.MainActivity
 import com.example.aegis.R
+import com.example.aegis.config.Config
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
 class DnsVpnService : VpnService() {
     private var vpnThread: Thread? = null
     private var vpnInterface: ParcelFileDescriptor? = null
     private var dnsResolver: DnsResolver? = null
+
+    /**
+     * Worker pool for DNS handling. The read loop must never block:
+     * forwardQuery can wait up to Config.DNS_TIMEOUT_MS on upstream, and
+     * doing that inline would stall every other DNS query on the device.
+     */
+    private var executor: ExecutorService? = null
+
+    /** Guards writes to the TUN descriptor, which workers share. */
+    private val writeLock = Any()
+
+    @Volatile
+    private var vpnOutput: FileOutputStream? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -51,10 +68,20 @@ class DnsVpnService : VpnService() {
     private fun stopVpn() {
         vpnThread?.interrupt()
         vpnThread = null
+
+        executor?.shutdownNow()
+        try {
+            executor?.awaitTermination(1, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+        }
+        executor = null
+
+        vpnOutput = null
         vpnInterface?.close()
         vpnInterface = null
         dnsResolver = null
         isRunning = false
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
@@ -82,12 +109,17 @@ class DnsVpnService : VpnService() {
         // Don't filter our own DNS lookups (avoids loops)
         try {
             builder.addDisallowedApplication(packageName)
-        } catch (_: Exception) { }
+        } catch (_: Exception) {
+        }
 
         vpnInterface = builder.establish() ?: return
 
         val input = FileInputStream(vpnInterface!!.fileDescriptor)
         val output = FileOutputStream(vpnInterface!!.fileDescriptor)
+        vpnOutput = output
+
+        executor = Executors.newFixedThreadPool(Config.DNS_THREAD_POOL_SIZE)
+
         val packet = ByteArray(32767)
 
         try {
@@ -99,21 +131,22 @@ class DnsVpnService : VpnService() {
                 if (version != 4) continue
 
                 val ihl = (packet[0].toInt() and 0x0F) * 4
+                if (ihl < 20 || length < ihl + 8) continue
+
                 val protocol = packet[9].toInt() and 0xFF
+                if (protocol != 17) continue // UDP only
 
-                if (protocol == 17) { // UDP
-                    val dstPort = ((packet[ihl + 2].toInt() and 0xFF) shl 8) or
-                            (packet[ihl + 3].toInt() and 0xFF)
+                val dstPort = ((packet[ihl + 2].toInt() and 0xFF) shl 8) or
+                        (packet[ihl + 3].toInt() and 0xFF)
+                if (dstPort != 53) continue
 
-                    if (dstPort == 53) {
-                        val response = dnsResolver?.handlePacket(packet, length, ihl)
-                        if (response != null) {
-                            output.write(response)
-                            if (dnsResolver?.lastQueryWasBlocked == true) {
-                                blockedCount.incrementAndGet()
-                            }
-                        }
-                    }
+                // The read buffer is reused on the next iteration, so the
+                // worker must get its own copy.
+                val copy = packet.copyOf(length)
+                try {
+                    executor?.execute { handleQuery(copy, length, ihl) }
+                } catch (_: Exception) {
+                    // Pool shutting down; drop the query.
                 }
             }
         } catch (e: InterruptedException) {
@@ -121,10 +154,31 @@ class DnsVpnService : VpnService() {
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
-            input.close()
-            output.close()
+            try { input.close() } catch (_: Exception) {}
+            try { output.close() } catch (_: Exception) {}
+            vpnOutput = null
             vpnInterface?.close()
             vpnInterface = null
+        }
+    }
+
+    /** Runs on a worker thread. May block on upstream DNS. */
+    private fun handleQuery(packet: ByteArray, length: Int, ihl: Int) {
+        val result = dnsResolver?.handlePacket(packet, length, ihl) ?: return
+
+        if (result.blocked) {
+            blockedCount.incrementAndGet()
+        }
+
+        val response = result.responsePacket ?: return
+        val out = vpnOutput ?: return
+
+        synchronized(writeLock) {
+            try {
+                out.write(response)
+            } catch (_: Exception) {
+                // Interface closed underneath us; nothing useful to do.
+            }
         }
     }
 

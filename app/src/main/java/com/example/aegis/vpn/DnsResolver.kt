@@ -1,95 +1,123 @@
 package com.example.aegis.vpn
 
-import android.util.Log
 import android.content.Context
+import android.util.Log
+import com.example.aegis.BuildConfig
+import com.example.aegis.config.Config
 import com.example.aegis.data.AppDatabase
 import kotlinx.coroutines.runBlocking
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
-import java.nio.ByteBuffer
+
+/**
+ * Outcome of handling one DNS packet.
+ *
+ * Returned rather than stored on the resolver so that concurrent workers
+ * do not race on shared mutable state.
+ */
+class DnsResult(val responsePacket: ByteArray?, val blocked: Boolean)
 
 /**
  * Handles raw IPv4/UDP packets from the TUN device.
  * Parses the DNS query inside, decides block/forward, and builds
  * a complete IPv4/UDP response packet to write back to the TUN.
+ *
+ * Thread safety: handlePacket is called concurrently from a worker pool.
+ * It holds no mutable state; the blocklist sets are immutable after
+ * assignment and marked @Volatile for safe publication.
  */
 class DnsResolver(context: Context) {
     private val db = AppDatabase.getDatabase(context)
-    private var blockedDomains: Set<String> = emptySet()
-    private var whitelistedDomains: Set<String> = emptySet()
-    private val upstreamDns = "8.8.8.8"
 
-    var lastQueryWasBlocked = false
-        private set
+    @Volatile
+    private var blockedDomains: Set<String> = emptySet()
+
+    @Volatile
+    private var whitelistedDomains: Set<String> = emptySet()
 
     init {
         reloadBlocklists()
     }
 
+    /**
+     * Loads blocklists into memory. Blocking, so call from a background
+     * thread only, and never from the packet path.
+     */
     fun reloadBlocklists() {
         runBlocking {
             blockedDomains = db.blockedDomainDao().getEnabledBlockedDomains().toSet()
             whitelistedDomains = db.whitelistDao().getWhitelistedDomains().toSet()
         }
+        log("blocklists loaded: ${blockedDomains.size} blocked, ${whitelistedDomains.size} whitelisted")
     }
 
     /**
-     * @param packet full IPv4 packet from TUN
+     * @param packet full IPv4 packet from TUN (must be a private copy, not a reused buffer)
      * @param length valid bytes in packet
      * @param ihl    IPv4 header length in bytes
-     * @return a full IPv4/UDP packet to write back, or null
      */
-    fun handlePacket(packet: ByteArray, length: Int, ihl: Int): ByteArray? {
-        lastQueryWasBlocked = false
+    fun handlePacket(packet: ByteArray, length: Int, ihl: Int): DnsResult {
         return try {
-            val udpHeaderStart = ihl
             val dnsStart = ihl + 8
             val dnsLength = length - dnsStart
-            if (dnsLength <= 12) return null
+            if (dnsLength <= 12) return DnsResult(null, false)
 
             val dnsQuery = ByteArray(dnsLength)
             System.arraycopy(packet, dnsStart, dnsQuery, 0, dnsLength)
 
             val domainName = DnsPacket.parseQueryName(dnsQuery)
 
-    val dnsResponse: ByteArray = when {
+            var wasBlocked = false
+            val dnsResponse: ByteArray = when {
                 isWhitelisted(domainName) -> {
-                    Log.d("Aegis", "ALLOW (whitelist) $domainName")
-                    forwardQuery(dnsQuery) ?: return null
+                    log("ALLOW (whitelist) $domainName")
+                    forwardQuery(dnsQuery) ?: return DnsResult(null, false)
                 }
                 isBlocked(domainName) -> {
-                    Log.d("Aegis", "BLOCK $domainName")
-                    lastQueryWasBlocked = true
+                    log("BLOCK $domainName")
+                    wasBlocked = true
                     createNxDomain(dnsQuery)
                 }
                 else -> {
-                    Log.d("Aegis", "FORWARD $domainName")
-                    forwardQuery(dnsQuery) ?: return null
+                    log("FORWARD $domainName")
+                    forwardQuery(dnsQuery) ?: return DnsResult(null, false)
                 }
             }
-buildResponsePacket(packet, ihl, dnsResponse)
+
+            DnsResult(buildResponsePacket(packet, ihl, dnsResponse), wasBlocked)
         } catch (e: Exception) {
-            null
+            DnsResult(null, false)
         }
     }
 
-    private fun isWhitelisted(domain: String): Boolean {
-        val d = domain.lowercase()
-        if (whitelistedDomains.contains(d)) return true
-        val parts = d.split(".")
-        for (i in 1 until parts.size) {
-            if (whitelistedDomains.contains(parts.subList(i, parts.size).joinToString("."))) return true
+    /**
+     * Debug logging. Compiled out of release builds by BuildConfig.DEBUG,
+     * and suppressed even in debug unless Config.LOG_DNS_QUERIES is on.
+     *
+     * This logs every domain the device resolves, so it must never be
+     * enabled in a shipped build.
+     */
+    private fun log(message: String) {
+        if (BuildConfig.DEBUG && Config.LOG_DNS_QUERIES) {
+            Log.d("Aegis", message)
         }
-        return false
     }
 
-    private fun isBlocked(domain: String): Boolean {
+    private fun isWhitelisted(domain: String): Boolean =
+        matchesSuffix(domain, whitelistedDomains)
+
+    private fun isBlocked(domain: String): Boolean =
+        matchesSuffix(domain, blockedDomains)
+
+    /** Exact match, or any parent domain present in the set. */
+    private fun matchesSuffix(domain: String, set: Set<String>): Boolean {
+        if (set.isEmpty()) return false
         val d = domain.lowercase()
-        if (blockedDomains.contains(d)) return true
+        if (set.contains(d)) return true
         val parts = d.split(".")
         for (i in 1 until parts.size) {
-            if (blockedDomains.contains(parts.subList(i, parts.size).joinToString("."))) return true
+            if (set.contains(parts.subList(i, parts.size).joinToString("."))) return true
         }
         return false
     }
@@ -97,8 +125,8 @@ buildResponsePacket(packet, ihl, dnsResponse)
     private fun forwardQuery(dnsQuery: ByteArray): ByteArray? {
         return try {
             DatagramSocket().use { socket ->
-                socket.soTimeout = 5000
-                val addr = InetAddress.getByName(upstreamDns)
+                socket.soTimeout = Config.DNS_TIMEOUT_MS
+                val addr = InetAddress.getByName(Config.PRIMARY_DNS)
                 socket.send(DatagramPacket(dnsQuery, dnsQuery.size, addr, 53))
                 val buf = ByteArray(4096)
                 val resp = DatagramPacket(buf, buf.size)
@@ -110,7 +138,7 @@ buildResponsePacket(packet, ihl, dnsResponse)
         }
     }
 
-    /** Flip the query into an NXDOMAIN response */
+    /** Flip the query into an NXDOMAIN response. */
     private fun createNxDomain(dnsQuery: ByteArray): ByteArray {
         val response = dnsQuery.copyOf()
         // QR=1 (response), RA=1, RCODE=3 (NXDOMAIN)
@@ -126,7 +154,7 @@ buildResponsePacket(packet, ihl, dnsResponse)
     /**
      * Build a full IPv4/UDP packet: swap src/dst addresses and ports
      * from the original query packet, attach the DNS response payload,
-     * and recompute checksums.
+     * and recompute the IP checksum.
      */
     private fun buildResponsePacket(query: ByteArray, ihl: Int, dnsPayload: ByteArray): ByteArray {
         val udpLength = 8 + dnsPayload.size
@@ -135,34 +163,28 @@ buildResponsePacket(packet, ihl, dnsResponse)
 
         // --- IPv4 header: copy then swap ---
         System.arraycopy(query, 0, out, 0, ihl)
-        // Total length
         out[2] = ((totalLength shr 8) and 0xFF).toByte()
         out[3] = (totalLength and 0xFF).toByte()
-        // Swap src (12..15) and dst (16..19)
         for (i in 0..3) {
             out[12 + i] = query[16 + i]
             out[16 + i] = query[12 + i]
         }
-        // TTL
-        out[8] = 64
-        // Zero checksum then recompute
+        out[8] = 64 // TTL
         out[10] = 0; out[11] = 0
         val ipCsum = checksum(out, 0, ihl)
         out[10] = ((ipCsum shr 8) and 0xFF).toByte()
         out[11] = (ipCsum and 0xFF).toByte()
 
         // --- UDP header: swap ports ---
-        out[ihl] = query[ihl + 2]         // src port = original dst port (53)
+        out[ihl] = query[ihl + 2]
         out[ihl + 1] = query[ihl + 3]
-        out[ihl + 2] = query[ihl]         // dst port = original src port
+        out[ihl + 2] = query[ihl]
         out[ihl + 3] = query[ihl + 1]
         out[ihl + 4] = ((udpLength shr 8) and 0xFF).toByte()
         out[ihl + 5] = (udpLength and 0xFF).toByte()
         out[ihl + 6] = 0; out[ihl + 7] = 0 // UDP checksum optional for IPv4
 
-        // --- DNS payload ---
         System.arraycopy(dnsPayload, 0, out, ihl + 8, dnsPayload.size)
-
         return out
     }
 
@@ -184,7 +206,7 @@ buildResponsePacket(packet, ihl, dnsResponse)
 }
 
 object DnsPacket {
-    /** Extract the query name from a raw DNS message */
+    /** Extract the query name from a raw DNS message. */
     fun parseQueryName(dns: ByteArray): String {
         val labels = mutableListOf<String>()
         var pos = 12 // skip DNS header

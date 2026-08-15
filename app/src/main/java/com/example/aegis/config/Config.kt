@@ -137,7 +137,7 @@ object Config {
     /**
      * Number of threads for DNS processing
      */
-    const val DNS_THREAD_POOL_SIZE = 2
+    const val DNS_THREAD_POOL_SIZE = 8
     
     // ========== Logging & Debug ==========
     
@@ -154,5 +154,5 @@ object Config {
     /**
      * Log DNS queries
      */
-    const val LOG_DNS_QUERIES = false
+    const val LOG_DNS_QUERIES = true
 }
