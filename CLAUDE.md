@@ -1,4 +1,4 @@
-# Aegis — project context for Claude Code
+# Aegis: project context for Claude Code
 
 Aegis is an Android DNS-filtering app. It runs a local `VpnService` that captures
 DNS queries, checks each domain against user-managed blocklists (Pi-hole / hosts
@@ -37,20 +37,35 @@ implement, no throughput penalty, and no battery cost from proxying real traffic
 ```
 
 ## Known gaps / good next tasks
+- No DNS response cache yet; every query hits upstream, and client retry storms
+  repeat the same blocked lookup dozens of times. An LRU keyed on (name, type)
+  with TTL respect and negative caching would cut both.
 - Blocklist changes require a VPN off/on cycle to take effect. Wiring
   `DnsResolver.reloadBlocklists()` to a broadcast would fix this.
-- No DNS response cache yet; every query hits upstream. An LRU keyed on
-  (name, type) with TTL respect would cut latency noticeably.
 - No per-domain block log; `blockedCount` is a session counter only.
 - IPv6 (AAAA over IPv6 transport) is not handled; only IPv4 UDP port 53.
 - DoH/DoT bypass: apps using their own encrypted DNS (Chrome's Secure DNS,
   Firefox DoH) will bypass filtering. Documented in README as a known limitation.
 - No unit tests. `DnsResolver.buildResponsePacket` and `BlocklistManager.parseBlocklistContent`
   are the highest-value targets.
+- Three leftover compiler warnings: unused `id` in MainActivity, redundant null
+  check and unnecessary `!!` in BlocklistManager.
 
 ## Things to be careful about
 - `applicationId` is still `com.example.aegis`. It **must** be changed to a domain
   you control before Play Store upload, and it can never be changed after first publish.
 - Packet parsing is index arithmetic on raw bytes. Verify IHL is read from the
   packet rather than assumed to be 20.
+- **Concurrency.** DNS handling runs on a worker pool, not the read loop. Three
+  invariants hold it together: the reused read buffer must be copied before
+  handoff; TUN writes must stay inside `synchronized(writeLock)`; and
+  `DnsResolver` must hold no mutable per-query state (results come back via
+  `DnsResult`). Breaking any of these produces intermittent, hard-to-reproduce
+  DNS corruption rather than a clean failure.
+- **Debug logging must never ship.** It is gated behind
+  `BuildConfig.DEBUG && Config.LOG_DNS_QUERIES` and stripped by a ProGuard
+  `-assumenosideeffects` rule. `buildConfig = true` must stay in `buildFeatures`.
+  Verify with the dex strings check in DEVELOPMENT.md section 10 after touching
+  the logging path.
 - Play Store requires a privacy policy URL for any app requesting VPN permission.
+- A release signing key exists outside the repo. See DEVELOPMENT.md section 13a.

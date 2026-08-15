@@ -1,6 +1,6 @@
 # Aegis: Technical Documentation
 
-_Status as of 15 August 2026. Covers the app as built, the environment it was built in, every fix applied along the way, and the known issues still outstanding._
+_Status as of 16 August 2026. Covers the app as built, the environment it was built in, every fix applied along the way, and the known issues still outstanding._
 
 ---
 
@@ -10,7 +10,7 @@ An Android app that blocks domains by filtering DNS locally. It runs a `VpnServi
 
 The effect: blocked domains fail to resolve, so both apps and browsers cannot reach them. No root required. Nothing is sent to any server that the user did not initiate.
 
-**Current state:** working. Installed and verified on a Moto g06 (Android 15, API 35). Blocking confirmed for social media domains, normal browsing unaffected.
+**Current state:** working. Installed and verified on a Moto g06 (Android 15, API 35). Blocking confirmed for social media domains, normal browsing unaffected. DNS handling is multi-threaded, debug logging is stripped from release builds, and a release signing key exists.
 
 ---
 
@@ -45,7 +45,7 @@ Routes: [ 10.111.222.53/32 -> 0.0.0.0 tun0, ::/0 unreachable ]}}
 
 ---
 
-## 3. Packet flow
+## 3. Packet flow and threading
 
 ```
 App resolves example.com
@@ -57,18 +57,23 @@ Android sends UDP to 10.111.222.53:53
 Route matches /32, packet enters tun0
         |
         v
-DnsVpnService read loop
+DnsVpnService read loop  (single thread, must never block)
    reads raw IPv4 packet from FileInputStream on the TUN fd
-   checks version == 4, protocol == 17 (UDP), dst port == 53
+   validates version == 4, ihl >= 20, protocol == 17, dst port == 53
+   copies the packet (the read buffer is reused)
+   submits to the worker pool, returns immediately to read again
+        |
+        v
+Worker thread (pool of Config.DNS_THREAD_POOL_SIZE, currently 8)
         |
         v
 DnsResolver.handlePacket(packet, length, ihl)
    extracts DNS payload at offset ihl + 8
    DnsPacket.parseQueryName() reads the QNAME labels
         |
-        +-- whitelisted?  -> forwardQuery()
-        +-- blocked?      -> createNxDomain()
-        +-- otherwise     -> forwardQuery()
+        +-- whitelisted?  -> forwardQuery()   (may block up to 5s)
+        +-- blocked?      -> createNxDomain() (instant, no network)
+        +-- otherwise     -> forwardQuery()   (may block up to 5s)
         |
         v
 buildResponsePacket()
@@ -78,8 +83,37 @@ buildResponsePacket()
    appends the DNS payload
         |
         v
-FileOutputStream on the TUN fd, back to the app
+DnsVpnService.handleQuery()
+   increments blockedCount if the result was blocked
+   writes to the TUN fd inside synchronized(writeLock)
 ```
+
+### Threading model
+
+The read loop and the resolver run on different threads by design. `forwardQuery`
+blocks for up to `Config.DNS_TIMEOUT_MS` waiting on upstream; doing that inline
+would stall every other DNS query on the device behind one slow lookup. On a fast
+network this is invisible, but on flaky mobile data it presents as the phone
+intermittently losing DNS entirely.
+
+Three constraints follow from this, all of which are easy to break by accident:
+
+**The read buffer must be copied before handoff.** `runVpn` reuses one 32767-byte
+array across iterations. Workers receive `packet.copyOf(length)`. Passing the
+shared array would corrupt queries under any concurrency.
+
+**Writes to the TUN descriptor are serialised.** Eight workers share one
+`FileOutputStream`, so `handleQuery` wraps the write in `synchronized(writeLock)`.
+
+**The resolver holds no mutable per-query state.** An earlier version stored
+`lastQueryWasBlocked` as a field on `DnsResolver`, which raced as soon as more
+than one worker existed. `handlePacket` now returns a `DnsResult(responsePacket,
+blocked)` and the caller acts on it. The blocklist sets are `@Volatile` and
+immutable after assignment, so concurrent reads are safe.
+
+Verification that the pool is live: in logcat, the third column is the thread id.
+Single-threaded operation shows one repeated tid; the current build shows eight
+distinct tids with overlapping timestamps.
 
 ### Packet construction details
 
@@ -112,8 +146,8 @@ The question section is preserved, which is what resolvers expect. Returning NXD
 
 | File | Responsibility |
 |---|---|
-| `vpn/DnsVpnService.kt` | TUN setup, foreground notification, read/write loop, session counter |
-| `vpn/DnsResolver.kt` | Query parsing, block decision, upstream forwarding, response packet building |
+| `vpn/DnsVpnService.kt` | TUN setup, foreground notification, read loop, worker pool dispatch, serialised writes, session counter |
+| `vpn/DnsResolver.kt` | Query parsing, block decision, upstream forwarding, response packet building, gated debug logging |
 | `data/BlocklistManager.kt` | Hosts/Pi-hole format parsing, import from URL/file/list, whitelist operations |
 | `data/AppDatabase.kt` | Room database, three DAOs |
 | `data/Blocklist.kt` | Entity definitions |
@@ -125,7 +159,11 @@ The question section is preserved, which is what resolvers expect. Returning NXD
 
 Runs as a **foreground service** with a persistent notification. This is not optional: Android kills background services that hold a VPN, and from API 34 the `foregroundServiceType` must be declared. The manifest uses `systemExempted` with matching permissions.
 
-`isRunning` and `blockedCount` are `companion object` statics so `MainActivity` can read them without binding to the service. `blockedCount` is an `AtomicLong` because it is written from the VPN thread and read from the UI thread.
+`isRunning` and `blockedCount` are `companion object` statics so `MainActivity` can read them without binding to the service. `blockedCount` is an `AtomicLong` because it is written from several worker threads and read from the UI thread.
+
+The executor is created in `runVpn` and shut down in `stopVpn` with
+`shutdownNow()` followed by a one second `awaitTermination`. Queries submitted
+after shutdown are dropped rather than throwing.
 
 `addDisallowedApplication(packageName)` excludes Aegis itself from the tunnel, preventing a loop where the resolver's own upstream lookups get captured by the resolver.
 
@@ -133,7 +171,7 @@ Runs as a **foreground service** with a persistent notification. This is not opt
 
 ### DnsResolver
 
-`reloadBlocklists()` uses `runBlocking` to read from Room synchronously. This is acceptable only because it runs once at service start, off the main thread. Do not call it from the packet loop.
+`reloadBlocklists()` uses `runBlocking` to read from Room synchronously. This is acceptable only because it runs once at service start, off the main thread. Do not call it from the packet path.
 
 Blocklists are held as in-memory `Set<String>` for O(1) lookup. With a large imported list (StevenBlack is roughly 150,000 entries) this is a few megabytes of heap, which is fine.
 
@@ -369,19 +407,53 @@ Anyone who can open Settings can turn the VPN off. This is a tool for reducing c
 
 ## 10. Reading the logcat
 
-The app logs nothing by default. Debug logging was added to `DnsResolver.handlePacket`:
+`DnsResolver` logs each decision through a private helper:
 
 ```kotlin
-Log.d("Aegis", "BLOCK $domainName")
-Log.d("Aegis", "FORWARD $domainName")
-Log.d("Aegis", "ALLOW (whitelist) $domainName")
+private fun log(message: String) {
+    if (BuildConfig.DEBUG && Config.LOG_DNS_QUERIES) {
+        Log.d("Aegis", message)
+    }
+}
 ```
 
 ```bash
 adb logcat -c && adb logcat -s Aegis:D
 ```
 
-**This logs every domain the device resolves.** Fine for debugging, but it must be gated behind `Config.DEBUG_MODE` or removed before any release build.
+**This logs every domain the device resolves**, which is exactly the kind of
+record that must not ship. Two layers prevent that:
+
+`BuildConfig.DEBUG` is a compile-time constant, so in a release build the branch,
+the `Log` call, and the string concatenation are all eliminated by the compiler
+rather than merely skipped at runtime. `Config.LOG_DNS_QUERIES` allows turning
+the feed off in debug builds too, without editing code.
+
+A ProGuard rule strips `Log.d` and `Log.v` from release bytecode as a second
+layer, in case a future `Log` call is added without the gate:
+
+```
+-assumenosideeffects class android.util.Log {
+    public static *** d(...);
+    public static *** v(...);
+}
+```
+
+`buildConfig = true` must stay in the `buildFeatures` block of
+`app/build.gradle.kts`, or `BuildConfig` is not generated and the gate fails to
+compile.
+
+**Verifying the strip.** This is worth re-running after any change to the logging
+path:
+
+```bash
+./gradlew assembleRelease
+unzip -p app/build/outputs/apk/release/*.apk classes.dex | strings \
+  | grep -E "BLOCK |FORWARD |ALLOW \(whitelist\)"
+```
+
+No output means the literals are absent from the dex. Any output means logging
+would ship.
 
 ### Noise to ignore
 
@@ -445,6 +517,17 @@ Recorded because several were non-obvious and could regress.
 
 **Missing launcher icon.** The build referenced `@mipmap/ic_launcher` which did not exist. Added an adaptive icon with a vector foreground.
 
+**Single-threaded resolver (fixed 16 Aug).** `forwardQuery` ran inline on the VPN
+read loop, so one slow upstream lookup blocked all DNS on the device. Moved to a
+fixed worker pool. Required three supporting changes: copying the reused read
+buffer before handoff, serialising TUN writes, and replacing the resolver's
+mutable `lastQueryWasBlocked` field with a returned `DnsResult`.
+
+**Unstripped debug logging (fixed 16 Aug).** Every resolved domain was logged
+unconditionally. Now gated behind `BuildConfig.DEBUG && Config.LOG_DNS_QUERIES`,
+with a ProGuard `-assumenosideeffects` rule as a second layer. Verified absent
+from the release dex.
+
 **Editing quirks.** Several syntax errors came from pasting multi-line replacements in `nano`: a lost closing brace, a missing `catch` block, and two statements concatenated onto one line (`}buildResponsePacket(...)`). Kotlin is not indentation-sensitive, so formatting is free, but brace balance is not. For anything larger than a one-line change, use an editor that shows brace matching, or hand the edit to a tool that reads the whole file.
 
 **Do not use `sudo` to edit files in the home directory.** It leaves root-owned files in the working tree and git then behaves strangely. If it has already happened: `sudo chown -R $USER:$USER <repo>`.
@@ -453,23 +536,34 @@ Recorded because several were non-obvious and could regress.
 
 ## 12. Known issues, in priority order
 
-1. **Single-threaded resolver.** `forwardQuery` blocks the VPN thread for up to five seconds waiting on upstream. One slow lookup stalls every other DNS query on the device. Not visible on a fast network; on flaky mobile data it would present as the phone intermittently losing DNS. Fix: hand queries to a small thread pool.
+1. **No DNS cache.** Every query, including repeats of a just-blocked domain, is
+   handled from scratch. Client retry storms are common: Chrome produced roughly
+   forty `BLOCK www.instagram.com` entries in under two seconds after a failed
+   load. An LRU keyed on (name, type) respecting TTL, with negative caching,
+   would collapse those to one lookup and cut latency on the forward path too.
 
-2. **No DNS cache.** Every query, including repeats of a just-blocked domain, is handled from scratch. The Instagram retry storm above would collapse to a single lookup with a negative cache. An LRU keyed on (name, type) respecting TTL would cut latency noticeably on the forward path too.
+2. **Blocklists require a VPN restart to apply.** See section 9.
 
-3. **Blocklists require a VPN restart to apply.** See section 9.
+3. **`applicationId` is still `com.example.aegis`.** Google rejects
+   `com.example.*`, and the ID can never be changed after first publish. Must be
+   renamed to an owned domain before any store upload.
 
-4. **Debug logging records every resolved domain.** Must be gated or removed before release.
+4. **No tests.** `parseBlocklistContent` and `buildResponsePacket` are the
+   highest-value targets, both being pure functions with clear inputs and
+   outputs.
 
-5. **`applicationId` is still `com.example.aegis`.** Google rejects `com.example.*`, and the ID can never be changed after first publish. Must be renamed to an owned domain before any store upload.
+5. **No IPv6.** Only IPv4 UDP port 53 is handled. AAAA queries over IPv4
+   transport work fine; DNS over IPv6 transport is not intercepted.
 
-6. **No tests.** `parseBlocklistContent` and `buildResponsePacket` are the highest-value targets, both being pure functions with clear inputs and outputs.
+6. **No per-domain block log.** `blockedCount` is a session counter that resets
+   when the service stops.
 
-7. **No IPv6.** Only IPv4 UDP port 53 is handled. AAAA queries over IPv4 transport work fine; DNS over IPv6 transport is not intercepted.
+7. **Three compiler warnings** left from the original code: an unused `id` in
+   `MainActivity`, and a redundant null check plus an unnecessary `!!` in
+   `BlocklistManager.parseBlocklistContent`. Cosmetic.
 
-8. **No per-domain block log.** `blockedCount` is a session counter that resets when the service stops.
-
----
+**Resolved:** single-threaded resolver and unstripped debug logging, both fixed
+16 August. See section 11.
 
 ## 13. Blocklist configuration as it stands
 
@@ -494,18 +588,71 @@ Note on Instagram: `static.cdninstagram.com` is deliberately not blocked. It is 
 
 ---
 
+## 13a. Release signing
+
+A signing key exists at `~/Documents/wip/coding/aegis-release.jks`, outside the
+repository. `.gitignore` excludes `*.jks`, `*.keystore`, and
+`keystore.properties`.
+
+**This key is irreplaceable once the app is published.** Losing it means never
+being able to update the listing. It needs a backup somewhere off this machine,
+and it is worth moving somewhere less incidental than a sibling of the repo,
+`~/.keystores/` for example.
+
+Generated with:
+
+```bash
+keytool -genkey -v -keystore aegis-release.jks \
+  -keyalg RSA -keysize 2048 -validity 10000 -alias aegis
+```
+
+The certificate carries `C=UK`, which is not a valid ISO 3166 code; the correct
+one for the United Kingdom is `GB`. keytool does not validate this and it will
+not block a Play Store upload, since Google re-signs under Play App Signing. If
+it is going to be corrected, it must be done before first publish.
+
+`app/build.gradle.kts` activates the signing config only when
+`AEGIS_KEYSTORE_PATH` is set in the environment, so an ordinary
+`./gradlew assembleRelease` on a machine without the key still succeeds and
+produces `app-release-unsigned.apk`.
+
+```bash
+cd ~/Documents/wip/coding/Aegis
+export AEGIS_KEYSTORE_PATH=~/Documents/wip/coding/aegis-release.jks
+export AEGIS_KEYSTORE_PASSWORD='...'
+export AEGIS_KEY_ALIAS=aegis
+export AEGIS_KEY_PASSWORD='...'
+
+./gradlew assembleRelease   # -> app-release.apk
+./gradlew bundleRelease     # -> app-release.aab, for the Play Store
+```
+
+If the output is still named `app-release-unsigned.apk`, the environment
+variables were not picked up. `adb install` rejects unsigned APKs with
+`INSTALL_PARSE_FAILED_NO_CERTIFICATES`.
+
+**Test the release build on a device before any submission.** `minifyEnabled` is
+on, and R8 can strip things Room needs at runtime. A crash that happens only in
+release almost always means a missing `proguard-rules.pro` keep rule.
+
 ## 14. Roadmap
 
 Ordered by value, suitable as individual tasks:
 
-1. Move `forwardQuery` off the VPN thread onto a small pool
+1. Import a real Pi-hole blocklist and confirm the import path holds up at scale.
+   With only 16 domains loaded, an ordinary Bing page load forwarded an entire
+   ad-tech cookie-sync cascade: `sync.taboola.com`, `ib.adnxs.com`,
+   `cms.quantserve.com`, `sync.mathtag.com`, `dsum-sec.casalemedia.com`,
+   `eb2.3lift.com`, `user-sync.fwmrm.net`, `ups.analytics.yahoo.com`. The
+   StevenBlack preset in the Import URL dialog would catch essentially all of it,
+   and importing roughly 150,000 domains is a genuine test of both the parser and
+   the in-memory set.
 2. Add an LRU DNS cache with TTL handling, including negative caching
 3. Wire `reloadBlocklists()` to a broadcast so blocklist changes apply live
-4. Gate debug logging behind `Config.DEBUG_MODE`
-5. Unit tests for `parseBlocklistContent` and `buildResponsePacket`
-6. Rename `applicationId` and package off `com.example.*`
-7. Per-domain block statistics with a simple history view
-8. Scheduled blocking, for example social media blocked during working hours
+4. Unit tests for `parseBlocklistContent` and `buildResponsePacket`
+5. Rename `applicationId` and package off `com.example.*`
+6. Per-domain block statistics with a simple history view
+7. Scheduled blocking, for example social media blocked during working hours
 
 Play Store preparation is documented separately in `RELEASE.md`, including keystore generation, the VPN declaration, the privacy policy requirement, and the realistic expectation that VPN-permission apps face extra review scrutiny.
 
@@ -527,6 +674,17 @@ adb logcat -c && adb logcat -s Aegis:D
 
 # adb not seeing the device
 sudo $(which adb) kill-server && adb kill-server && adb start-server && adb devices
+
+# Signed release build
+export AEGIS_KEYSTORE_PATH=~/Documents/wip/coding/aegis-release.jks
+export AEGIS_KEYSTORE_PASSWORD='...'
+export AEGIS_KEY_ALIAS=aegis
+export AEGIS_KEY_PASSWORD='...'
+./gradlew assembleRelease
+
+# Confirm debug logging is absent from the release dex
+unzip -p app/build/outputs/apk/release/*.apk classes.dex | strings \
+  | grep -E "BLOCK |FORWARD "        # expect no output
 
 # Push to the personal account
 git remote -v                # must show git@github-db588:...
