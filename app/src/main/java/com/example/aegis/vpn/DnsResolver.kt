@@ -29,7 +29,7 @@ class DnsResolver(context: Context) {
     fun reloadBlocklists() {
         runBlocking {
             blockedDomains = db.blockedDomainDao().getEnabledBlockedDomains().toSet()
-            whitelistedDomains = db.whitelistDao().getWhitelistedDomains()
+            whitelistedDomains = db.whitelistDao().getWhitelistedDomains().toSet()
         }
     }
 

@@ -54,7 +54,7 @@ interface BlockedDomainDao {
 @Dao
 interface WhitelistDao {
     @Query("SELECT domain FROM whitelist")
-    suspend fun getWhitelistedDomains(): Set<String>
+    suspend fun getWhitelistedDomains(): List<String>
 
     @Query("SELECT * FROM whitelist ORDER BY addedAt DESC")
     fun getAllWhitelisted(): Flow<List<WhitelistedDomain>>
