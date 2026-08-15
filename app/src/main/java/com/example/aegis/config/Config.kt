@@ -83,15 +83,15 @@ object Config {
         "facebook.com",
         "fb.com",
         "instagram.com",
-        "whatsapp.com",
+//        "whatsapp.com",
         
         // TikTok
         "tiktok.com",
         "douyin.com",
         
         // Messaging
-        "discord.gg",
-        "discord.com",
+//        "discord.gg",
+//        "discord.com",
         "telegram.org",
         "telegram.me",
         "snapchat.com",
@@ -101,6 +101,9 @@ object Config {
         
         // Threads
         "threads.net",
+
+        // Substack
+        "substack.com",
         
         // YouTube (optional - uncomment to block)
         // "youtube.com",

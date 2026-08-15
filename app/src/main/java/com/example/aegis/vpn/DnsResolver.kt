@@ -1,5 +1,6 @@
 package com.example.aegis.vpn
 
+import android.util.Log
 import android.content.Context
 import com.example.aegis.data.AppDatabase
 import kotlinx.coroutines.runBlocking
@@ -52,16 +53,22 @@ class DnsResolver(context: Context) {
 
             val domainName = DnsPacket.parseQueryName(dnsQuery)
 
-            val dnsResponse: ByteArray = when {
-                isWhitelisted(domainName) -> forwardQuery(dnsQuery) ?: return null
+    val dnsResponse: ByteArray = when {
+                isWhitelisted(domainName) -> {
+                    Log.d("Aegis", "ALLOW (whitelist) $domainName")
+                    forwardQuery(dnsQuery) ?: return null
+                }
                 isBlocked(domainName) -> {
+                    Log.d("Aegis", "BLOCK $domainName")
                     lastQueryWasBlocked = true
                     createNxDomain(dnsQuery)
                 }
-                else -> forwardQuery(dnsQuery) ?: return null
+                else -> {
+                    Log.d("Aegis", "FORWARD $domainName")
+                    forwardQuery(dnsQuery) ?: return null
+                }
             }
-
-            buildResponsePacket(packet, ihl, dnsResponse)
+buildResponsePacket(packet, ihl, dnsResponse)
         } catch (e: Exception) {
             null
         }
