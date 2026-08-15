@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Aegis</string>
+    <string name="vpn_status_active">Aegis active — DNS filtering on</string>
+    <string name="vpn_status_inactive">Aegis stopped</string>
+    <string name="btn_add_social_media">Social Media</string>
+    <string name="btn_import_url">Import URL</string>
+    <string name="btn_import_file">Import File</string>
+    <string name="btn_whitelist">Whitelist</string>
+    <string name="blocklists_title">Blocklists</string>
+    <string name="blocked_count">%1$d domains blocked this session</string>
+</resources>

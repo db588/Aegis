@@ -1,0 +1,24 @@
+Aegis is a lightweight DNS filter that runs entirely on your device.
+
+It blocks social media sites, advertising, trackers and known malicious domains by filtering DNS queries locally. Blocked domains simply fail to resolve, so both apps and browsers are unable to reach them.
+
+FEATURES
+
+• One-tap protection toggle
+• Pre-loaded social media blocklist
+• Import Pi-hole and hosts-format blocklists from a URL or a local file
+• Enable, disable or delete individual blocklists
+• Whitelist manager for anything blocked by mistake
+• Live counter of blocked queries
+
+PRIVACY
+
+Aegis has no accounts, no analytics and no servers. Your blocklists are stored in a local database on your device. The only network activity is normal DNS resolution and blocklist downloads that you start yourself.
+
+WHY A VPN PERMISSION
+
+Android requires the VPN permission to inspect DNS traffic. Aegis uses it purely locally: it routes only DNS through the tunnel and does not proxy, log or transmit your traffic anywhere. The source code is public so you can verify this.
+
+LIMITATIONS
+
+Apps and browsers that use their own encrypted DNS (DNS-over-HTTPS) bypass system DNS and will not be filtered. Disable Secure DNS in your browser and Private DNS in Android settings for full coverage. Only one VPN can be active at a time on Android.

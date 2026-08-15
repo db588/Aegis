@@ -1,0 +1,1 @@
+On-device DNS filtering. Block social media, ads and trackers. No root, no cloud.
