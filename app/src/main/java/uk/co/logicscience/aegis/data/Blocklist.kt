@@ -1,4 +1,4 @@
-package com.example.aegis.data
+package uk.co.logicscience.aegis.data
 
 import androidx.room.Entity
 import androidx.room.PrimaryKey

@@ -2,18 +2,18 @@
 
 ## Before you start: two things that are permanent
 
-**1. Change the application ID.** It is currently `com.example.aegis`. Google
-will reject `com.example.*`, and the ID can never be changed after your first
-publish. Use a domain you control, reversed:
+**1. Confirm the application ID.** It is `uk.co.logicscience.aegis` — a domain
+you control, reversed, so Google won't reject it. The ID can never be changed
+after your first publish, so double-check it's final before that point:
 
 ```kotlin
 // app/build.gradle.kts
-applicationId = "uk.me.yourdomain.aegis"
-namespace = "uk.me.yourdomain.aegis"
+applicationId = "uk.co.logicscience.aegis"
+namespace = "uk.co.logicscience.aegis"
 ```
 
-Then rename the package directories and update the `package`/`import` lines
-to match. Claude Code can do this in one pass.
+If it ever needs to change, rename the package directories and update the
+`package`/`import` lines to match. Claude Code can do this in one pass.
 
 **2. Guard your keystore.** If you lose it you cannot ever update the app under
 the same listing. Back it up somewhere that is not just your laptop.

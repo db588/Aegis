@@ -69,14 +69,16 @@ Worker thread (pool of Config.DNS_THREAD_POOL_SIZE, currently 8)
         v
 DnsResolver.handlePacket(packet, length, ihl)
    extracts DNS payload at offset ihl + 8
-   DnsPacket.parseQueryName() reads the QNAME labels
+   DnsPacket.parseQueryName() / parseQueryType() read QNAME + QTYPE
         |
-        +-- whitelisted?  -> forwardQuery()   (may block up to 5s)
-        +-- blocked?      -> createNxDomain() (instant, no network)
-        +-- otherwise     -> forwardQuery()   (may block up to 5s)
+        +-- cache hit (name, qtype)? -> reuse cached response or NXDOMAIN, skip below
+        |
+        +-- whitelisted?  -> forwardQuery()   (may block up to 5s), then cache it
+        +-- blocked?      -> createNxDomain() (instant, no network), negative-cache it
+        +-- otherwise     -> forwardQuery()   (may block up to 5s), then cache it
         |
         v
-buildResponsePacket()
+DnsPacket.buildResponsePacket()
    copies the IPv4 header, swaps src/dst addresses
    swaps UDP src/dst ports
    sets total length, TTL, recomputes IP checksum
@@ -147,7 +149,7 @@ The question section is preserved, which is what resolvers expect. Returning NXD
 | File | Responsibility |
 |---|---|
 | `vpn/DnsVpnService.kt` | TUN setup, foreground notification, read loop, worker pool dispatch, serialised writes, session counter |
-| `vpn/DnsResolver.kt` | Query parsing, block decision, upstream forwarding, response packet building, gated debug logging |
+| `vpn/DnsResolver.kt` | Query parsing, block decision, upstream forwarding, LRU response cache, response packet building, gated debug logging |
 | `data/BlocklistManager.kt` | Hosts/Pi-hole format parsing, import from URL/file/list, whitelist operations |
 | `data/AppDatabase.kt` | Room database, three DAOs |
 | `data/Blocklist.kt` | Entity definitions |
@@ -171,9 +173,11 @@ after shutdown are dropped rather than throwing.
 
 ### DnsResolver
 
-`reloadBlocklists()` uses `runBlocking` to read from Room synchronously. This is acceptable only because it runs once at service start, off the main thread. Do not call it from the packet path.
+`reloadBlocklists()` uses `runBlocking` to read from Room synchronously. It runs once at service start and again on every `ACTION_RELOAD_BLOCKLISTS` broadcast, always on its own background thread (`DnsVpnService` spins up a short-lived thread per reload) — never from the packet path.
 
 Blocklists are held as in-memory `Set<String>` for O(1) lookup. With a large imported list (StevenBlack is roughly 150,000 entries) this is a few megabytes of heap, which is fine.
+
+A response cache sits in front of block/forward decisions, keyed on (name, qtype): an LRU `LinkedHashMap` bounded by `Config.DNS_CACHE_SIZE`, synchronized on itself because access-order mode reorders its internal list even on reads. Forwarded responses are cached for the minimum TTL among their answer records (capped at `Config.DNS_CACHE_TTL`); blocked domains get a negative-cache entry at the same TTL cap. `reloadBlocklists()` clears the cache, so a blocklist edit can't be masked by a stale cached decision.
 
 Subdomain matching walks the label list upward:
 
@@ -279,7 +283,7 @@ The system Gradle is only a bootstrap to generate the wrapper. After that, `./gr
 ./gradlew lint
 ```
 
-Debug installs as `com.example.aegis.debug` (via `applicationIdSuffix`), so debug and release builds can coexist on one device.
+Debug installs as `uk.co.logicscience.aegis.debug` (via `applicationIdSuffix`), so debug and release builds can coexist on one device.
 
 ---
 
@@ -366,11 +370,9 @@ The two ports are different. Pairing uses one, connecting uses the one on the ma
 
 ## 9. Runtime quirks
 
-### Blocklist changes need a VPN restart
+### Blocklist changes apply live
 
-`DnsResolver` loads its blocklists into memory once, when the service starts. Adding, removing, enabling, or disabling a list does nothing until the VPN is toggled off and on. `MainActivity` shows a toast reminding the user, which is a workaround rather than a fix.
-
-Fixing this properly means wiring `reloadBlocklists()` to a broadcast or binding the service. It is the highest-value item on the roadmap.
+`DnsResolver` loads its blocklists into memory when the service starts, and `MainActivity` sends a `LocalBroadcastManager` broadcast (`DnsVpnService.ACTION_RELOAD_BLOCKLISTS`) whenever a blocklist or whitelist entry is added, removed, enabled, or disabled. `DnsVpnService` reloads on a dedicated background thread so the read loop is never blocked. No VPN restart is needed.
 
 ### Config.SOCIAL_MEDIA_DOMAINS is only read at list creation
 
@@ -394,7 +396,7 @@ This is a fundamental limitation of the DNS-filtering approach, not a bug, and i
 Android permits exactly one active `VpnService`. Starting Aegis displaced RethinkDNS on the test device, visible in the log as:
 
 ```
-Vpn: Switched from com.celzero.bravedns to com.example.aegis.debug
+Vpn: Switched from com.celzero.bravedns to uk.co.logicscience.aegis.debug
 ```
 
 Worth remembering when comparing behaviour against another blocker: they cannot run simultaneously.
@@ -536,31 +538,18 @@ from the release dex.
 
 ## 12. Known issues, in priority order
 
-1. **No DNS cache.** Every query, including repeats of a just-blocked domain, is
-   handled from scratch. Client retry storms are common: Chrome produced roughly
-   forty `BLOCK www.instagram.com` entries in under two seconds after a failed
-   load. An LRU keyed on (name, type) respecting TTL, with negative caching,
-   would collapse those to one lookup and cut latency on the forward path too.
-
-2. **Blocklists require a VPN restart to apply.** See section 9.
-
-3. **`applicationId` is still `com.example.aegis`.** Google rejects
-   `com.example.*`, and the ID can never be changed after first publish. Must be
-   renamed to an owned domain before any store upload.
-
-4. **No tests.** `parseBlocklistContent` and `buildResponsePacket` are the
-   highest-value targets, both being pure functions with clear inputs and
-   outputs.
-
-5. **No IPv6.** Only IPv4 UDP port 53 is handled. AAAA queries over IPv4
+1. **No IPv6.** Only IPv4 UDP port 53 is handled. AAAA queries over IPv4
    transport work fine; DNS over IPv6 transport is not intercepted.
 
-6. **No per-domain block log.** `blockedCount` is a session counter that resets
+2. **No per-domain block log.** `blockedCount` is a session counter that resets
    when the service stops.
 
-7. **Three compiler warnings** left from the original code: an unused `id` in
-   `MainActivity`, and a redundant null check plus an unnecessary `!!` in
-   `BlocklistManager.parseBlocklistContent`. Cosmetic.
+Resolved since the list above was written: an LRU DNS cache keyed on (name,
+type) with TTL respect and negative caching (`DnsResolver`/`DnsPacket`);
+blocklist changes now apply live via a broadcast (section 9); `applicationId`
+is renamed to `uk.co.logicscience.aegis`; unit tests cover
+`parseBlocklistContent` and `DnsPacket.buildResponsePacket`; and the three
+leftover compiler warnings are fixed.
 
 **Resolved:** single-threaded resolver and unstripped debug logging, both fixed
 16 August. See section 11.
@@ -647,12 +636,13 @@ Ordered by value, suitable as individual tasks:
    StevenBlack preset in the Import URL dialog would catch essentially all of it,
    and importing roughly 150,000 domains is a genuine test of both the parser and
    the in-memory set.
-2. Add an LRU DNS cache with TTL handling, including negative caching
-3. Wire `reloadBlocklists()` to a broadcast so blocklist changes apply live
-4. Unit tests for `parseBlocklistContent` and `buildResponsePacket`
-5. Rename `applicationId` and package off `com.example.*`
-6. Per-domain block statistics with a simple history view
-7. Scheduled blocking, for example social media blocked during working hours
+2. Per-domain block statistics with a simple history view
+3. Scheduled blocking, for example social media blocked during working hours
+
+Done since this list was last ordered: an LRU DNS cache with TTL handling and
+negative caching; live blocklist reload via broadcast; unit tests for
+`parseBlocklistContent` and `DnsPacket.buildResponsePacket`; and the
+`applicationId`/package rename off `com.example.*` to `uk.co.logicscience.aegis`.
 
 Play Store preparation is documented separately in `RELEASE.md`, including keystore generation, the VPN declaration, the privacy policy requirement, and the realistic expectation that VPN-permission apps face extra review scrutiny.
 

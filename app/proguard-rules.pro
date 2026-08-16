@@ -3,7 +3,7 @@
 -dontwarn androidx.room.paging.**
 
 # Keep VpnService subclass name (referenced from manifest)
--keep class com.example.aegis.vpn.DnsVpnService { *; }
+-keep class uk.co.logicscience.aegis.vpn.DnsVpnService { *; }
 
 # Kotlin coroutines
 -dontwarn kotlinx.coroutines.**

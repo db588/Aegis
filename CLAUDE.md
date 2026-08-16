@@ -52,8 +52,8 @@ implement, no throughput penalty, and no battery cost from proxying real traffic
   check and unnecessary `!!` in BlocklistManager.
 
 ## Things to be careful about
-- `applicationId` is still `com.example.aegis`. It **must** be changed to a domain
-  you control before Play Store upload, and it can never be changed after first publish.
+- `applicationId` is `uk.co.logicscience.aegis`. It can never be changed after
+  first Play Store publish, so confirm this is the final value before that point.
 - Packet parsing is index arithmetic on raw bytes. Verify IHL is read from the
   packet rather than assumed to be 20.
 - **Concurrency.** DNS handling runs on a worker pool, not the read loop. Three

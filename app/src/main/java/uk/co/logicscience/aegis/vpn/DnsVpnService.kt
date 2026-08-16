@@ -1,19 +1,24 @@
-package com.example.aegis.vpn
+package uk.co.logicscience.aegis.vpn
 
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
-import com.example.aegis.MainActivity
-import com.example.aegis.R
-import com.example.aegis.config.Config
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import uk.co.logicscience.aegis.MainActivity
+import uk.co.logicscience.aegis.R
+import uk.co.logicscience.aegis.config.Config
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.IOException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -36,6 +41,27 @@ class DnsVpnService : VpnService() {
 
     @Volatile
     private var vpnOutput: FileOutputStream? = null
+
+    /**
+     * Reload requests come in on the main thread via LocalBroadcastManager.
+     * reloadBlocklists() does a blocking DB read, so each request is handed
+     * off to its own short-lived thread rather than run inline — that keeps
+     * both the caller and the VPN read loop unblocked. DnsResolver publishes
+     * the new sets through @Volatile fields, so workers pick them up safely
+     * without any lock.
+     */
+    private val reloadReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val resolver = dnsResolver ?: return
+            Thread({ resolver.reloadBlocklists() }, "AegisBlocklistReload").start()
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        LocalBroadcastManager.getInstance(this)
+            .registerReceiver(reloadReceiver, IntentFilter(ACTION_RELOAD_BLOCKLISTS))
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -151,6 +177,10 @@ class DnsVpnService : VpnService() {
             }
         } catch (e: InterruptedException) {
             // Expected on stop
+        } catch (e: IOException) {
+            // Expected when the user revokes the VPN permission (or another
+            // VPN app takes over) — the TUN fd is torn out from under the
+            // read loop. Not an error, so exit quietly.
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
@@ -215,6 +245,7 @@ class DnsVpnService : VpnService() {
 
     override fun onDestroy() {
         stopVpn()
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(reloadReceiver)
         super.onDestroy()
     }
 
@@ -224,8 +255,9 @@ class DnsVpnService : VpnService() {
     }
 
     companion object {
-        const val ACTION_START = "com.example.aegis.START_VPN"
-        const val ACTION_STOP = "com.example.aegis.STOP_VPN"
+        const val ACTION_START = "uk.co.logicscience.aegis.START_VPN"
+        const val ACTION_STOP = "uk.co.logicscience.aegis.STOP_VPN"
+        const val ACTION_RELOAD_BLOCKLISTS = "uk.co.logicscience.aegis.RELOAD_BLOCKLISTS"
         const val FAKE_DNS = "10.111.222.53"
         private const val NOTIFICATION_ID = 1
 

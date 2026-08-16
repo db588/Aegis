@@ -1,4 +1,4 @@
-package com.example.aegis
+package uk.co.logicscience.aegis
 
 import android.view.LayoutInflater
 import android.view.ViewGroup
@@ -8,7 +8,7 @@ import android.widget.TextView
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
-import com.example.aegis.data.Blocklist
+import uk.co.logicscience.aegis.data.Blocklist
 
 class BlocklistAdapter : ListAdapter<Blocklist, BlocklistAdapter.ViewHolder>(BlocklistDiffCallback()) {
     

@@ -1,4 +1,4 @@
-package com.example.aegis
+package uk.co.logicscience.aegis
 
 import android.app.Activity
 import android.content.Intent
@@ -18,13 +18,14 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import androidx.lifecycle.lifecycleScope
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import com.example.aegis.config.Config
-import com.example.aegis.data.AppDatabase
-import com.example.aegis.data.BlocklistManager
-import com.example.aegis.data.WhitelistedDomain
-import com.example.aegis.vpn.DnsVpnService
+import uk.co.logicscience.aegis.config.Config
+import uk.co.logicscience.aegis.data.AppDatabase
+import uk.co.logicscience.aegis.data.BlocklistManager
+import uk.co.logicscience.aegis.data.WhitelistedDomain
+import uk.co.logicscience.aegis.vpn.DnsVpnService
 import kotlinx.coroutines.launch
 
 class MainActivity : AppCompatActivity() {
@@ -123,7 +124,7 @@ class MainActivity : AppCompatActivity() {
         adapter.onEnableToggle = { blocklist, enabled ->
             lifecycleScope.launch {
                 blocklistManager.updateBlocklistStatus(blocklist.id, enabled)
-                promptVpnRestartIfRunning()
+                notifyBlocklistsChanged()
             }
         }
 
@@ -134,7 +135,7 @@ class MainActivity : AppCompatActivity() {
                 .setPositiveButton("Delete") { _, _ ->
                     lifecycleScope.launch {
                         blocklistManager.deleteBlocklist(blocklist.id)
-                        promptVpnRestartIfRunning()
+                        notifyBlocklistsChanged()
                     }
                 }
                 .setNegativeButton("Cancel", null)
@@ -169,13 +170,10 @@ class MainActivity : AppCompatActivity() {
         updateStatus("Aegis stopped")
     }
 
-    private fun promptVpnRestartIfRunning() {
+    private fun notifyBlocklistsChanged() {
         if (DnsVpnService.isRunning) {
-            Toast.makeText(
-                this,
-                "Toggle Aegis off and on to apply changes",
-                Toast.LENGTH_SHORT
-            ).show()
+            LocalBroadcastManager.getInstance(this)
+                .sendBroadcast(Intent(DnsVpnService.ACTION_RELOAD_BLOCKLISTS))
         }
     }
 
@@ -258,7 +256,7 @@ class MainActivity : AppCompatActivity() {
             val id = blocklistManager.importBlocklistFromUrl(name, "Imported from URL", url)
             if (id != null) {
                 Toast.makeText(this@MainActivity, "Imported $name", Toast.LENGTH_SHORT).show()
-                promptVpnRestartIfRunning()
+                notifyBlocklistsChanged()
             } else {
                 Toast.makeText(this@MainActivity, "Import failed — check URL", Toast.LENGTH_LONG).show()
                 updateStatus("Import failed")
@@ -275,9 +273,9 @@ class MainActivity : AppCompatActivity() {
                     return@launch
                 }
                 val fileName = uri.lastPathSegment?.substringAfterLast('/') ?: "Imported file"
-                val id = blocklistManager.importBlocklistFromContent(fileName, "Imported from file", content)
+                blocklistManager.importBlocklistFromContent(fileName, "Imported from file", content)
                 Toast.makeText(this@MainActivity, "Imported $fileName", Toast.LENGTH_SHORT).show()
-                promptVpnRestartIfRunning()
+                notifyBlocklistsChanged()
             } catch (e: Exception) {
                 Toast.makeText(this@MainActivity, "Import failed: ${e.message}", Toast.LENGTH_LONG).show()
             }
@@ -321,7 +319,7 @@ class MainActivity : AppCompatActivity() {
                     lifecycleScope.launch {
                         blocklistManager.addToWhitelist(domain)
                         Toast.makeText(this@MainActivity, "$domain whitelisted", Toast.LENGTH_SHORT).show()
-                        promptVpnRestartIfRunning()
+                        notifyBlocklistsChanged()
                     }
                 }
             }
@@ -335,7 +333,7 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton("Remove") { _, _ ->
                 lifecycleScope.launch {
                     blocklistManager.removeFromWhitelist(domain)
-                    promptVpnRestartIfRunning()
+                    notifyBlocklistsChanged()
                 }
             }
             .setNegativeButton("Cancel", null)

@@ -1,4 +1,4 @@
-package com.example.aegis.data
+package uk.co.logicscience.aegis.data
 
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
@@ -35,8 +35,7 @@ class BlocklistManager(private val context: Context) {
                         else -> line.lowercase()
                     }
                 }
-                .filter { it != null && isValidDomain(it) }
-                .map { it!! }
+                .filter { isValidDomain(it) }
                 .toSet()
         }
     }

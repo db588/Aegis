@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.aegis"
+    namespace = "uk.co.logicscience.aegis"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.aegis"
+        applicationId = "uk.co.logicscience.aegis"
         minSdk = 24
         targetSdk = 34
         versionCode = 1
@@ -70,8 +70,12 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.9.1")
     implementation("androidx.recyclerview:recyclerview:1.3.2")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
+    implementation("androidx.localbroadcastmanager:localbroadcastmanager:1.1.0")
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     ksp("androidx.room:room-compiler:2.6.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.mockito:mockito-core:5.12.0")
 }

@@ -1,4 +1,4 @@
-package com.example.aegis.config
+package uk.co.logicscience.aegis.config
 
 /**
  * Configuration constants for DNS Blocker app
